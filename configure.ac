@@ -400,6 +400,9 @@ if test x$enable_music_midi = xyes; then
                 EXTRA_LDFLAGS="$EXTRA_LDFLAGS -lmidi" 
                 PC_LIBS="$PC_LIBS -lmidi"
                 ;;
+            *-*-mint*)
+                use_music_native_midi=yes
+                ;;
         esac
         if test x$use_music_native_midi = xyes; then
             EXTRA_CFLAGS="$EXTRA_CFLAGS -DUSE_NATIVE_MIDI -I\$(srcdir)/native_midi"

@@ -425,6 +425,7 @@ native_midi/native_midi_common.h
 native_midi/native_midi_haiku.cpp
 native_midi/native_midi_mac.c
 native_midi/native_midi_macosx.c
+native_midi/native_midi_mint.c
 native_midi/native_midi_win32.c
 playmus.c
 playwave.c

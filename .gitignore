@@ -53,3 +53,5 @@ Release
 # Ignore these when switching between branches
 SDL2_mixer.pc
 SDL2_mixer.spec
+
+.qtc_clangd/

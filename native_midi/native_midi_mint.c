@@ -56,12 +56,12 @@ struct _NativeMidiSong
 };
 static NativeMidiSong s_nativeMidiSong;
 static volatile MIDIEvent *s_events;
-static Uint32 s_old_timer_a;
-static Uint16 s_timer_a_ctrl = 0, s_timer_a_data = 1;
+static Uint32 s_old_timer_b;
+static Uint16 s_timer_b_ctrl = 0, s_timer_b_data = 1;
 
-static void setup_timer_a();
+static void setup_timer_b();
 
-static void __attribute__((interrupt)) timer_a(void)
+static void __attribute__((interrupt)) timer_b(void)
 {
     /* initially equals to zero */
     static Uint32 counter;
@@ -70,12 +70,12 @@ static void __attribute__((interrupt)) timer_a(void)
     volatile MIDIEvent *ev = s_events;
 
     if (!ev)
-        goto timer_a_done;
+        goto timer_b_done;
 
     if (ev->time > counter)
     {
         counter++;
-        goto timer_a_done;
+        goto timer_b_done;
     }
 
     /* ev points to the first event with time == counter */
@@ -88,8 +88,8 @@ static void __attribute__((interrupt)) timer_a(void)
             if (ev->data[0] == 0x51)
             {
                 song->microsecondsPerQuarterNote = (ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2];
-                setup_timer_a();
-                Xbtimer(XB_TIMERA, s_timer_a_ctrl, s_timer_a_data, timer_a);
+                setup_timer_b();
+                Xbtimer(XB_TIMERB, s_timer_b_ctrl, s_timer_b_data, timer_b);
             }
             else if (ev->data[0] == 0x58)
             {
@@ -114,11 +114,11 @@ static void __attribute__((interrupt)) timer_a(void)
     counter = 1;
     s_events = ev;
 
-timer_a_done:
-    *(volatile unsigned char *)0xFFFFFA0FL &= ~(1 << 5);    /* clear in service bit */
+timer_b_done:
+    *(volatile unsigned char *)0xFFFFFA0FL &= ~(1 << 0);    /* clear in service bit */
 }
 
-static void setup_timer_a()
+static void setup_timer_b()
 {
     static const Uint32 clock = 2457600;
     static const Uint32 dividers[8] = { -1, 4, 10, 16, 50, 64, 100, 200 };
@@ -126,11 +126,11 @@ static void setup_timer_a()
     int i, j;
     float diff = UINT_MAX;
 
-    if (s_old_timer_a)
+    if (s_old_timer_b)
     {
-        Jdisint(MFP_TIMERA);
-        (void)Setexc(0x134>>2, s_old_timer_a);
-        s_old_timer_a = 0;
+        Jdisint(MFP_TIMERB);
+        (void)Setexc(0x120>>2, s_old_timer_b);
+        s_old_timer_b = 0;
     }
 
     printf("Requesting: %.2f Hz\n", desired_clock);
@@ -146,21 +146,21 @@ static void setup_timer_a()
             if (val >= desired_clock && val - desired_clock < diff)
             {
                 diff = val - desired_clock;
-                s_timer_a_ctrl = i;
-                s_timer_a_data = j;
+                s_timer_b_ctrl = i;
+                s_timer_b_data = j;
             }
             else if (desired_clock > val && desired_clock - val < diff)
             {
                 diff = desired_clock - val;
-                s_timer_a_ctrl = i;
-                s_timer_a_data = j;
+                s_timer_b_ctrl = i;
+                s_timer_b_data = j;
             }
         }
     }
 
-    printf("Got: %.2f Hz\n", (float)clock / dividers[s_timer_a_ctrl] / s_timer_a_data);
+    printf("Got: %.2f Hz\n", (float)clock / dividers[s_timer_b_ctrl] / s_timer_b_data);
 
-    s_old_timer_a = (Uint32)Setexc(0x134>>2, -1);
+    s_old_timer_b = (Uint32)Setexc(0x120>>2, -1);
 }
 
 int native_midi_detect()
@@ -179,7 +179,7 @@ NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw)
 
     s_events = s_nativeMidiSong.events;
 
-    setup_timer_a();
+    setup_timer_b();
 
     if (freerw)
         SDL_RWclose(rw);
@@ -216,11 +216,12 @@ void native_midi_start(NativeMidiSong *song, int loops)
     if (!song->events)
         return;
 
+    /* TODO */
     song->loops = loops;
 
     assert(song == &s_nativeMidiSong);
 
-    Xbtimer(XB_TIMERA, s_timer_a_ctrl, s_timer_a_data, timer_a);
+    Xbtimer(XB_TIMERB, s_timer_b_ctrl, s_timer_b_data, timer_b);
     song->active = 1;
 }
 
@@ -228,7 +229,12 @@ void native_midi_stop()
 {
     printf("%s\n", __FUNCTION__);
 
-    Jdisint(MFP_TIMERA);
+    if (s_old_timer_b)
+    {
+        Jdisint(MFP_TIMERB);
+        (void)Setexc(0x120>>2, s_old_timer_b);
+        s_old_timer_b = 0;
+    }
     s_nativeMidiSong.active = 0;
 }
 

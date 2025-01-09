@@ -23,6 +23,9 @@
 #ifdef __MINT__
 
 #include <assert.h>
+#include <limits.h>
+
+#include <mint/osbind.h>
 
 #include "native_midi.h"
 #include "native_midi_common.h"
@@ -52,6 +55,113 @@ struct _NativeMidiSong
     Uint8 timeSignature[2];
 };
 static NativeMidiSong s_nativeMidiSong;
+static volatile MIDIEvent *s_events;
+static Uint32 s_old_timer_a;
+static Uint16 s_timer_a_ctrl = 0, s_timer_a_data = 1;
+
+static void setup_timer_a();
+
+static void __attribute__((interrupt)) timer_a(void)
+{
+    /* initially equals to zero */
+    static Uint32 counter;
+
+    NativeMidiSong *song = &s_nativeMidiSong;
+    volatile MIDIEvent *ev = s_events;
+
+    if (!ev)
+        goto timer_a_done;
+
+    if (ev->time > counter)
+    {
+        counter++;
+        goto timer_a_done;
+    }
+
+    /* ev points to the first event with time == counter */
+    do
+    {
+        if (ev->status == 0xff)
+        {
+            printf("%08x: %02x, %02x: ", ev->time, ev->status, ev->data[0]);
+
+            if (ev->data[0] == 0x51)
+            {
+                song->microsecondsPerQuarterNote = (ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2];
+                setup_timer_a();
+                Xbtimer(XB_TIMERA, s_timer_a_ctrl, s_timer_a_data, timer_a);
+            }
+            else if (ev->data[0] == 0x58)
+            {
+                song->timeSignature[0] = ev->extraData[0];
+                song->timeSignature[1] = 1 << ev->extraData[1];
+            }
+        }
+        else
+        {
+            static Uint8 buf[3];
+            buf[0] = ev->status;
+            buf[1] = ev->data[0];
+            buf[2] = ev->data[1];
+            Midiws(3-1, buf);
+        }
+
+        ev = ev->next;
+        /* time == 0 means "send immediatelly after this one" */
+    } while (ev && ev->time == 0);
+
+    /* set to one as we have just processed all the messages immediatelly following the initial tick time */
+    counter = 1;
+    s_events = ev;
+
+timer_a_done:
+    *(volatile unsigned char *)0xFFFFFA0FL &= ~(1 << 5);    /* clear in service bit */
+}
+
+static void setup_timer_a()
+{
+    static const Uint32 clock = 2457600;
+    static const Uint32 dividers[8] = { -1, 4, 10, 16, 50, 64, 100, 200 };
+    const float desired_clock = (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / s_nativeMidiSong.microsecondsPerQuarterNote;
+    int i, j;
+    float diff = UINT_MAX;
+
+    if (s_old_timer_a)
+    {
+        Jdisint(MFP_TIMERA);
+        (void)Setexc(0x134>>2, s_old_timer_a);
+        s_old_timer_a = 0;
+    }
+
+    printf("Requesting: %.2f Hz\n", desired_clock);
+
+    for (i = 7; i > 0; --i)
+    {
+        const float prescaled = clock / dividers[i];
+
+        for (j = 1; j < 256; ++j)
+        {
+            float val = prescaled / j;
+            /* avoid math.h's abs() */
+            if (val >= desired_clock && val - desired_clock < diff)
+            {
+                diff = val - desired_clock;
+                s_timer_a_ctrl = i;
+                s_timer_a_data = j;
+            }
+            else if (desired_clock > val && desired_clock - val < diff)
+            {
+                diff = desired_clock - val;
+                s_timer_a_ctrl = i;
+                s_timer_a_data = j;
+            }
+        }
+    }
+
+    printf("Got: %.2f Hz\n", (float)clock / dividers[s_timer_a_ctrl] / s_timer_a_data);
+
+    s_old_timer_a = (Uint32)Setexc(0x134>>2, -1);
+}
 
 int native_midi_detect()
 {
@@ -66,6 +176,10 @@ NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw)
     s_nativeMidiSong.microsecondsPerQuarterNote = 500000UL;
     s_nativeMidiSong.timeSignature[0] = 4;
     s_nativeMidiSong.timeSignature[1] = 4;
+
+    s_events = s_nativeMidiSong.events;
+
+    setup_timer_a();
 
     if (freerw)
         SDL_RWclose(rw);
@@ -104,42 +218,9 @@ void native_midi_start(NativeMidiSong *song, int loops)
 
     song->loops = loops;
 
-    MIDIEvent *ev = song->events;
+    assert(song == &s_nativeMidiSong);
 
-    while (ev)
-    {
-        if (ev->status == 0xff)
-        {
-            int i;
-            printf("%08x: %02x, %02x: ", ev->time, ev->status, ev->data[0]);
-            for (i = 0; i < ev->extraLen; i++)
-            {
-                printf("%02x ", ev->extraData[i]);
-            }
-            printf("\n");
-
-            if (ev->data[0] == 0x51)
-            {
-                assert(ev->extraLen == 3);
-                song->microsecondsPerQuarterNote = (ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2];
-                printf("microsecondsPerQuarterNote: %u, bpm: %u, tick time: %f\n",
-                       song->microsecondsPerQuarterNote, 60000000U / song->microsecondsPerQuarterNote, (float)song->microsecondsPerQuarterNote / (float)song->ticksPerQuarterNote);
-            }
-            else if (ev->data[0] == 0x58)
-            {
-                assert(ev->extraLen == 2);
-                song->timeSignature[0] = ev->extraData[0];
-                song->timeSignature[1] = 1 << ev->extraData[1];
-                printf("time signature: %d/%d\n", song->timeSignature[0], song->timeSignature[1]);
-            }
-        }
-        else
-        {
-            printf("%08x: %02x, %02x, %02x\n", ev->time, ev->status, ev->data[0], ev->data[1]);
-        }
-        ev = ev->next;
-    }
-
+    Xbtimer(XB_TIMERA, s_timer_a_ctrl, s_timer_a_data, timer_a);
     song->active = 1;
 }
 
@@ -147,6 +228,7 @@ void native_midi_stop()
 {
     printf("%s\n", __FUNCTION__);
 
+    Jdisint(MFP_TIMERA);
     s_nativeMidiSong.active = 0;
 }
 
@@ -154,7 +236,7 @@ int native_midi_active()
 {
     /*printf("%s\n", __FUNCTION__);*/
 
-    return s_nativeMidiSong.active;
+    return s_nativeMidiSong.active && s_events;
 }
 
 void native_midi_setvolume(int volume)

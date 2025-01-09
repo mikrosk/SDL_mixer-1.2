@@ -58,28 +58,19 @@ static NativeMidiSong s_nativeMidiSong;
 static volatile MIDIEvent *s_events;
 static Uint32 s_old_timer_b;
 static Uint16 s_timer_b_ctrl = 0, s_timer_b_data = 1;
+static volatile Uint32 s_timer_b_counter;
 
 static void setup_timer_b();
 
 static void __attribute__((interrupt)) timer_b(void)
 {
-    /* initially equals to zero */
-    static Uint32 counter;
-
     NativeMidiSong *song = &s_nativeMidiSong;
     volatile MIDIEvent *ev = s_events;
 
-    if (!ev)
+    if (!ev || ev->time > s_timer_b_counter)
         goto timer_b_done;
 
-    if (ev->time > counter)
-    {
-        counter++;
-        goto timer_b_done;
-    }
-
-    /* ev points to the first event with time == counter */
-    do
+    while (ev && ev->time == s_timer_b_counter)
     {
         if (ev->status == 0xff)
         {
@@ -107,14 +98,11 @@ static void __attribute__((interrupt)) timer_b(void)
         }
 
         ev = ev->next;
-        /* time == 0 means "send immediatelly after this one" */
-    } while (ev && ev->time == 0);
-
-    /* set to one as we have just processed all the messages immediatelly following the initial tick time */
-    counter = 1;
+    }
     s_events = ev;
 
 timer_b_done:
+    s_timer_b_counter++;
     *(volatile unsigned char *)0xFFFFFA0FL &= ~(1 << 0);    /* clear in service bit */
 }
 
@@ -235,6 +223,9 @@ void native_midi_stop()
         (void)Setexc(0x120>>2, s_old_timer_b);
         s_old_timer_b = 0;
     }
+
+    s_timer_b_counter = 0;
+
     s_nativeMidiSong.active = 0;
 }
 

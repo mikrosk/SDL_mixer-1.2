@@ -32,94 +32,105 @@
 
 struct _NativeMidiSong
 {
-    /* delta times are stored as ticks */
     MIDIEvent *events;
+    MIDIEvent *firstEvent;
     int loops;
     SDL_bool active;
 
-    /*
-     * Tempo ~ in beats per minute (BPM), 120 by default
-     * MIDI quarter note = 1 beat long (i.e. two eighth notes per beat, four sixteenth notes per beat, ...)
-     * MIDI half note = 2 beats long
-     * MIDI whole note = 4 beats long
-     * Time signature = number of beats in a bar / how many quarter notes there are in a beat:
-     *      - 4/4 = four quarter-notes per bar (MIDI default)
-     *      - 4/2 = four half-notes per bar (or 8 quarter notes)
-     *      - 4/8 = four eighth-notes per bar (or 2 quarter notes)
-     *      - 2/4 = two quarter-notes per bar
-     */
     Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
-    Uint32 microsecondsPerQuarterNote;  /* 500 000 by default, set by sysex; 24ths of a microsecond per MIDI clock */
-    /* microsecondsPerTick (tick time) = microsecondsPerQuarterNote / ticksPerQuarterNote */
-    /* elapsed ticks = (ticksPerQuarterNote / microsecondsPerQuarterNote) * 1000 * elapsed_time_in_ms */
-    Uint8 timeSignature[2];
+
+    Uint32 old_timer_b;
+    volatile Uint32 timer_b_counter;
+    struct
+    {
+        Uint8 ctrl;
+        Uint8 data;
+    } timer_b_values[256];
+    volatile Uint8 timer_b_current_value;
 };
 static NativeMidiSong s_nativeMidiSong;
-static volatile MIDIEvent *s_events;
-static Uint32 s_old_timer_b;
-static Uint16 s_timer_b_ctrl = 0, s_timer_b_data = 1;
-static volatile Uint32 s_timer_b_counter;
-
-static void setup_timer_b();
 
 static void __attribute__((interrupt)) timer_b(void)
 {
     NativeMidiSong *song = &s_nativeMidiSong;
-    volatile MIDIEvent *ev = s_events;
+    MIDIEvent *ev = song->events;
 
-    if (!ev || ev->time > s_timer_b_counter)
-        goto timer_b_done;
-
-    while (ev && ev->time == s_timer_b_counter)
+    while (ev && ev->time == song->timer_b_counter)
     {
         if (ev->status == 0xff)
         {
-            printf("%08x: %02x, %02x: ", ev->time, ev->status, ev->data[0]);
+            /* Meta messages (not to be sent over MIDI ports) */
+            //printf("%08x: %02x, %02x\n", ev->time, ev->status, ev->data[0]);
 
             if (ev->data[0] == 0x51)
             {
-                song->microsecondsPerQuarterNote = (ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2];
-                setup_timer_b();
-                Xbtimer(XB_TIMERB, s_timer_b_ctrl, s_timer_b_data, timer_b);
-            }
-            else if (ev->data[0] == 0x58)
-            {
-                song->timeSignature[0] = ev->extraData[0];
-                song->timeSignature[1] = 1 << ev->extraData[1];
+                song->timer_b_current_value++;
+                *(volatile Uint8 *)0xFFFFFA1BL = song->timer_b_values[song->timer_b_current_value].ctrl;
+                *(volatile Uint8 *)0xFFFFFA21L = song->timer_b_values[song->timer_b_current_value].data;
             }
         }
         else
         {
+#if 0
             static Uint8 buf[3];
             buf[0] = ev->status;
-            buf[1] = ev->data[0];
-            buf[2] = ev->data[1];
-            Midiws(3-1, buf);
+#else
+            volatile Uint8 *midi_acia_ctrl = (volatile Uint8 *)0xFFFFFC04L;
+            volatile Uint8 *midi_acia_data = (volatile Uint8 *)0xFFFFFC06L;
+#endif
+            switch(ev->status >> 4)
+            {
+            case MIDI_STATUS_NOTE_OFF:
+            case MIDI_STATUS_NOTE_ON:
+            case MIDI_STATUS_AFTERTOUCH:
+            case MIDI_STATUS_CONTROLLER:
+            case MIDI_STATUS_PITCH_WHEEL:
+#if 0
+                    buf[1] = ev->data[0];
+                    buf[2] = ev->data[1];
+                    Midiws(3-1, buf);
+#else
+                while ((*midi_acia_ctrl & (1 << 1)) == 0);
+                *midi_acia_data = ev->status;
+                while ((*midi_acia_ctrl & (1 << 1)) == 0);
+                *midi_acia_data = ev->data[0];
+                while ((*midi_acia_ctrl & (1 << 1)) == 0);
+                *midi_acia_data = ev->data[1];
+#endif
+                break;
+
+            case MIDI_STATUS_PROG_CHANGE:
+            case MIDI_STATUS_PRESSURE:
+#if 0
+                    buf[1] = ev->data[0];
+                    Midiws(2-1, buf);
+#else
+                while ((*midi_acia_ctrl & (1 << 1)) == 0);
+                *midi_acia_data = ev->status;
+                while ((*midi_acia_ctrl & (1 << 1)) == 0);
+                *midi_acia_data = ev->data[0];
+#endif
+                break;
+
+            default:
+                printf("Unknown status: %02x\n", ev->status);
+            }
         }
 
         ev = ev->next;
     }
-    s_events = ev;
+    song->events = ev;
+    song->timer_b_counter++;
 
-timer_b_done:
-    s_timer_b_counter++;
-    *(volatile unsigned char *)0xFFFFFA0FL &= ~(1 << 0);    /* clear in service bit */
+    *(volatile Uint8 *)0xFFFFFA0FL &= ~(1 << 0);    /* clear in service bit */
 }
 
-static void setup_timer_b()
+static void setup_timer(float desired_clock, Uint8 *ctrl, Uint8 *data)
 {
     static const Uint32 clock = 2457600;
     static const Uint32 dividers[8] = { -1, 4, 10, 16, 50, 64, 100, 200 };
-    const float desired_clock = (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / s_nativeMidiSong.microsecondsPerQuarterNote;
     int i, j;
     float diff = UINT_MAX;
-
-    if (s_old_timer_b)
-    {
-        Jdisint(MFP_TIMERB);
-        (void)Setexc(0x120>>2, s_old_timer_b);
-        s_old_timer_b = 0;
-    }
 
     printf("Requesting: %.2f Hz\n", desired_clock);
 
@@ -129,26 +140,19 @@ static void setup_timer_b()
 
         for (j = 1; j < 256; ++j)
         {
-            float val = prescaled / j;
+            float diff_current = (prescaled / j) - desired_clock;
             /* avoid math.h's abs() */
-            if (val >= desired_clock && val - desired_clock < diff)
+            diff_current = diff_current >= 0 ? diff_current : -diff_current;
+            if (diff_current < diff)
             {
-                diff = val - desired_clock;
-                s_timer_b_ctrl = i;
-                s_timer_b_data = j;
-            }
-            else if (desired_clock > val && desired_clock - val < diff)
-            {
-                diff = desired_clock - val;
-                s_timer_b_ctrl = i;
-                s_timer_b_data = j;
+                diff = diff_current;
+                *ctrl = i;
+                *data = j;
             }
         }
     }
 
-    printf("Got: %.2f Hz\n", (float)clock / dividers[s_timer_b_ctrl] / s_timer_b_data);
-
-    s_old_timer_b = (Uint32)Setexc(0x120>>2, -1);
+    printf("Got: %.2f Hz\n", (float)clock / dividers[*ctrl] / *data);
 }
 
 int native_midi_detect()
@@ -158,58 +162,72 @@ int native_midi_detect()
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw)
 {
+    int timer_b_index = 0;
+
     printf("%s\n", __FUNCTION__);
 
-    s_nativeMidiSong.events = CreateMIDIEventList(rw, &s_nativeMidiSong.ticksPerQuarterNote);
-    s_nativeMidiSong.microsecondsPerQuarterNote = 500000UL;
-    s_nativeMidiSong.timeSignature[0] = 4;
-    s_nativeMidiSong.timeSignature[1] = 4;
+    s_nativeMidiSong.events = s_nativeMidiSong.firstEvent = CreateMIDIEventList(rw, &s_nativeMidiSong.ticksPerQuarterNote);
+    s_nativeMidiSong.timer_b_counter = 0;
+    s_nativeMidiSong.timer_b_current_value = 0;
 
-    s_events = s_nativeMidiSong.events;
+    setup_timer(
+        (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / 500000,
+        &s_nativeMidiSong.timer_b_values[timer_b_index].ctrl,
+        &s_nativeMidiSong.timer_b_values[timer_b_index].data);
+    timer_b_index++;
 
-    setup_timer_b();
+    for (const MIDIEvent *ev = s_nativeMidiSong.firstEvent; ev; ev = ev->next)
+    {
+        if (ev->status == 0xff && ev->data[0] == 0x51)
+        {
+            if (timer_b_index == 255)
+            {
+                printf("Too many tempo changes\n");
+                return NULL;
+            }
+
+            setup_timer(
+                (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / ((ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2]),
+                &s_nativeMidiSong.timer_b_values[timer_b_index].ctrl,
+                &s_nativeMidiSong.timer_b_values[timer_b_index].data);
+            timer_b_index++;
+        }
+    }
 
     if (freerw)
         SDL_RWclose(rw);
 
-    /*
-     * fluidsynth: debug: tempo=500000, tick time=1.945525 msec, cur time=0 msec, cur tick=0
-     * fluidsynth: debug: tempo=1804806, tick time=7.022591 msec, cur time=0 msec, cur tick=0
-     *
-     * microsecondsPerQuarterNote: 500000, bpm: 120, tick time: 1945.525269
-     * microsecondsPerQuarterNote: 1804806, bpm: 33, tick time: 7022.591309
-     */
-    printf("ticksPerQuarterNote: %d\n", s_nativeMidiSong.ticksPerQuarterNote);
-    printf("microsecondsPerQuarterNote: %u, bpm: %u, tick time: %f\n",
-           s_nativeMidiSong.microsecondsPerQuarterNote,
-           60000000U / s_nativeMidiSong.microsecondsPerQuarterNote,
-           (float)s_nativeMidiSong.microsecondsPerQuarterNote / (float)s_nativeMidiSong.ticksPerQuarterNote);
-    printf("time signature: %d/%d\n", s_nativeMidiSong.timeSignature[0], s_nativeMidiSong.timeSignature[1]);
-
-    return s_nativeMidiSong.events ? &s_nativeMidiSong : NULL;
+    return s_nativeMidiSong.firstEvent ? &s_nativeMidiSong : NULL;
 }
 
 void native_midi_freesong(NativeMidiSong *song)
 {
     printf("%s\n", __FUNCTION__);
 
-    FreeMIDIEventList(song->events);
-    song->events = NULL;
+    FreeMIDIEventList(song->firstEvent);
+    song->firstEvent = song->events = NULL;
 }
 
 void native_midi_start(NativeMidiSong *song, int loops)
 {
     printf("%s: %d\n", __FUNCTION__, loops);
 
-    if (!song->events)
+    assert(song == &s_nativeMidiSong);
+
+    if (song->active)
         return;
+
+    song->events = s_nativeMidiSong.firstEvent;
+    song->timer_b_counter = 0;
+    song->timer_b_current_value = 0;
 
     /* TODO */
     song->loops = loops;
 
-    assert(song == &s_nativeMidiSong);
+    Jdisint(MFP_TIMERB);
+    song->old_timer_b = (Uint32)Setexc(0x120>>2, -1);
+    Xbtimer(XB_TIMERB, song->timer_b_values[song->timer_b_current_value].ctrl, song->timer_b_values[song->timer_b_current_value].data, timer_b);
 
-    Xbtimer(XB_TIMERB, s_timer_b_ctrl, s_timer_b_data, timer_b);
     song->active = 1;
 }
 
@@ -217,28 +235,43 @@ void native_midi_stop()
 {
     printf("%s\n", __FUNCTION__);
 
-    if (s_old_timer_b)
+    Jdisint(MFP_TIMERB);
+    if (s_nativeMidiSong.old_timer_b)
     {
-        Jdisint(MFP_TIMERB);
-        (void)Setexc(0x120>>2, s_old_timer_b);
-        s_old_timer_b = 0;
+        (void)Setexc(0x120>>2, s_nativeMidiSong.old_timer_b);
+        s_nativeMidiSong.old_timer_b = 0;
     }
-
-    s_timer_b_counter = 0;
 
     s_nativeMidiSong.active = 0;
 }
 
 int native_midi_active()
 {
-    /*printf("%s\n", __FUNCTION__);*/
+    /* printf("%s (%d/%p)\n", __FUNCTION__, s_nativeMidiSong.active, s_nativeMidiSong.events); */
 
-    return s_nativeMidiSong.active && s_events;
+    return s_nativeMidiSong.active && s_nativeMidiSong.events;
 }
 
 void native_midi_setvolume(int volume)
 {
+    int i;
+    Uint32 counter;
+    /* https://www.recordingblogs.com/wiki/midi-controller-message (channel 0 out of 15) */
+    Uint8 controller_message[3] = { 0xB0, 0x07, volume };
+
     printf("%s: %d\n", __FUNCTION__, volume);
+
+    if (native_midi_active())
+    {
+        counter = s_nativeMidiSong.timer_b_counter;
+        while (counter == s_nativeMidiSong.timer_b_counter);
+    }
+
+    for (i = 0; i < 16; ++i)
+    {
+        Midiws(3-1, controller_message);
+        controller_message[0]++;
+    }
 }
 
 const char *native_midi_error(void)

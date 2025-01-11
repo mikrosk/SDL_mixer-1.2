@@ -254,6 +254,7 @@ int native_midi_active()
 
 void native_midi_setvolume(int volume)
 {
+#if 0
     int i;
     Uint32 counter;
     /* https://www.recordingblogs.com/wiki/midi-controller-message (channel 0 out of 15) */
@@ -272,6 +273,7 @@ void native_midi_setvolume(int volume)
         Midiws(3-1, controller_message);
         controller_message[0]++;
     }
+#endif
 }
 
 const char *native_midi_error(void)

@@ -122,7 +122,7 @@ static void __attribute__((interrupt)) timer_b(void)
     song->events = ev;
     song->timer_b_counter++;
 
-    *(volatile Uint8 *)0xFFFFFA0FL &= ~(1 << 0);    /* clear in service bit */
+    *(volatile Uint8 *)0xFFFFFA0FL = ~(1 << 0);    /* clear in service bit */
 }
 
 static void setup_timer(float desired_clock, Uint8 *ctrl, Uint8 *data)

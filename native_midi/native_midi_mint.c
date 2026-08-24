@@ -1,6 +1,6 @@
 /*
   native_midi:  Hardware Midi support on Atari for the SDL_mixer library
-  Copyright (C) 2025  Miro Kropacek <miro.kropacek@gmail.com>
+  Copyright (C) 2026  Miro Kropacek <miro.kropacek@gmail.com>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -23,16 +23,68 @@
 #ifdef __MINT__
 
 #include <assert.h>
-#include <limits.h>
 
 #include <mint/osbind.h>
+#include <mint/ostruct.h>
 
 #include "native_midi.h"
 #include "native_midi_common.h"
 
+/*
+ * Two interrupt sources, one FIFO between them:
+ *
+ * 1. Timer B is the PRODUCER, running at a constant 960 Hz (2457600 /
+ *    16 / 160), i.e. ~1 ms event timing resolution. Each interrupt adds
+ *    a 16.16 fixed-point increment (MIDI ticks per timer period, derived
+ *    from ticksPerQuarterNote and the current tempo) to the song
+ *    position and pushes the bytes of events that became due into the
+ *    FIFO. A tempo change merely recomputes the increment, so any tempo
+ *    and any tick rate are representable exactly. A full FIFO pauses
+ *    event processing until space frees up; bytes are never dropped.
+ *
+ * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
+ *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
+ *    interrupt per byte and none when idle. Both ACIAs share MFP GPIP
+ *    I4 (channel 6, vector $118); the TOS handler ("midikey") loops
+ *    calling kb_midisys and kb_ikbdsys until the interrupt line is
+ *    released, so we hook kb_midisys via Kbdvbase() and chain the
+ *    original for the receive side. The transmit interrupt (TIE) is
+ *    enabled ONLY while the FIFO is non-empty: an empty transmit
+ *    register asserts IRQ permanently, and since nothing would clear
+ *    it, the midikey loop would hang the machine. The hook therefore
+ *    always either sends a byte or turns TIE off before returning.
+ */
+
+#define MIDI_ACIA_CTRL  (*(volatile Uint8 *)0xFFFFFC04L)
+#define MIDI_ACIA_DATA  (*(volatile Uint8 *)0xFFFFFC06L)
+#define ACIA_TDRE       (1 << 1)
+
+/* /16 clock, 8N1, RTS low, TX interrupt off, RX interrupt on.*/
+#define ACIA_CTRL_TIE_OFF   0x95
+/* /16 clock, 8N1, RTS low, TX interrupt on, RX interrupt on.*/
+#define ACIA_CTRL_TIE_ON    0xB5
+
+#define MFP_ISRA        (*(volatile Uint8 *)0xFFFFFA0FL)
+
+#define MFP_CLOCK       2457600UL
+#define TIMER_B_CTRL    3       /* prescaler /16 */
+#define TIMER_B_PRESCALER 16
+#define TIMER_B_DATA    160     /* 2457600/16/160 = 960 Hz */
+
+#define TICK_NUMER      ((Uint32)((65536ULL \
+                                       * TIMER_B_PRESCALER \
+                                       * TIMER_B_DATA \
+                                       * 1000000 \
+                                       + MFP_CLOCK/2) / MFP_CLOCK))
+
+#define DEFAULT_TEMPO   500000UL    /* us per quarter note (120 bpm) */
+
+#define FIFO_SIZE       2048        /* power of two */
+#define FIFO_MASK       (FIFO_SIZE - 1)
+
 struct _NativeMidiSong
 {
-    MIDIEvent *events;
+    MIDIEvent *events;      /* next event to schedule */
     MIDIEvent *firstEvent;
     int loops;
     SDL_bool active;
@@ -40,119 +92,206 @@ struct _NativeMidiSong
     Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
 
     Uint32 old_timer_b;
-    volatile Uint32 timer_b_counter;
-    struct
-    {
-        Uint8 ctrl;
-        Uint8 data;
-    } timer_b_values[256];
-    volatile Uint8 timer_b_current_value;
 };
 static NativeMidiSong s_nativeMidiSong;
 
+/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
+ * Every timer interrupt executes s_tickFrac += s_tickAdd; whenever
+ * s_tickFrac crosses 1.0, the whole part moves into s_tickInt and only
+ * the fraction stays. */
+static Uint32 s_tickAdd;
+static Uint32 s_tickFrac;
+static Uint32 s_tickInt;
+
+static Uint8 s_fifo[FIFO_SIZE];
+static volatile Uint16 s_fifoHead, s_fifoTail;
+
+static volatile SDL_bool s_tie;     /* shadow: is the TX interrupt enabled? */
+static long (*s_oldMidisys)(void);
+static _KBDVECS *s_kbdvecs;
+
+static __inline__ Uint16 fifo_space(void)
+{
+    return FIFO_SIZE - 1 - ((s_fifoHead - s_fifoTail) & FIFO_MASK);
+}
+
+static __inline__ void fifo_push(Uint8 b)
+{
+    s_fifo[s_fifoHead] = b;
+    s_fifoHead = (s_fifoHead + 1) & FIFO_MASK;
+}
+
+/* Returns how many MIDI ticks elapse during one timer period, as 16.16
+ * fixed point: 65536 * ticksPerQuarterNote * period_us / tempo_us. */
+static __inline__ Uint32 midi_ticks_per_period(Uint32 tempo)
+{
+    Uint32 q, r;
+
+    q = TICK_NUMER / tempo;
+    r = TICK_NUMER % tempo;
+
+    return s_nativeMidiSong.ticksPerQuarterNote * q
+         + (s_nativeMidiSong.ticksPerQuarterNote * r + tempo / 2) / tempo;
+}
+
+/* Producer: schedule due events into the FIFO, arm the ACIA TX interrupt */
 static void __attribute__((interrupt)) timer_b(void)
 {
     NativeMidiSong *song = &s_nativeMidiSong;
-    MIDIEvent *ev = song->events;
+    MIDIEvent *ev;
 
-    while (ev && ev->time == song->timer_b_counter)
+    /* advance song position */
+    s_tickFrac += s_tickAdd;
+    s_tickInt += s_tickFrac >> 16;
+    s_tickFrac &= 0xffff;
+
+    /* schedule due events */
+    ev = song->events;
+    while (ev && ev->time <= s_tickInt)
     {
-        if (ev->status == 0xff)
-        {
-            /* Meta messages (not to be sent over MIDI ports) */
-            //printf("%08x: %02x, %02x\n", ev->time, ev->status, ev->data[0]);
+        const Uint8 status = ev->status;
 
-            if (ev->data[0] == 0x51)
+        if (status == 0xff)
+        {
+            /* Meta event; never sent over the wire */
+            if (ev->data[0] == 0x51 && ev->extraLen == 3)
             {
-                song->timer_b_current_value++;
-                *(volatile Uint8 *)0xFFFFFA1BL = song->timer_b_values[song->timer_b_current_value].ctrl;
-                *(volatile Uint8 *)0xFFFFFA21L = song->timer_b_values[song->timer_b_current_value].data;
+                /* Tempo change */
+                Uint32 tempo = ((Uint32)ev->extraData[0] << 16)
+                             | ((Uint32)ev->extraData[1] << 8)
+                             |  (Uint32)ev->extraData[2];
+                if (tempo)
+                    s_tickAdd = midi_ticks_per_period(tempo);
             }
+            /* 0x2f (end of track) and the rest are ignored;
+             * end of song == end of the event list */
         }
         else
         {
-#if 0
-            static Uint8 buf[3];
-            buf[0] = ev->status;
-#else
-            volatile Uint8 *midi_acia_ctrl = (volatile Uint8 *)0xFFFFFC04L;
-            volatile Uint8 *midi_acia_data = (volatile Uint8 *)0xFFFFFC06L;
-#endif
-            switch(ev->status >> 4)
+            switch (status >> 4)
             {
             case MIDI_STATUS_NOTE_OFF:
             case MIDI_STATUS_NOTE_ON:
             case MIDI_STATUS_AFTERTOUCH:
             case MIDI_STATUS_CONTROLLER:
             case MIDI_STATUS_PITCH_WHEEL:
-#if 0
-                    buf[1] = ev->data[0];
-                    buf[2] = ev->data[1];
-                    Midiws(3-1, buf);
-#else
-                while ((*midi_acia_ctrl & (1 << 1)) == 0);
-                *midi_acia_data = ev->status;
-                while ((*midi_acia_ctrl & (1 << 1)) == 0);
-                *midi_acia_data = ev->data[0];
-                while ((*midi_acia_ctrl & (1 << 1)) == 0);
-                *midi_acia_data = ev->data[1];
-#endif
+                if (fifo_space() < 3)
+                    goto fifo_full;
+                fifo_push(status);
+                fifo_push(ev->data[0]);
+                fifo_push(ev->data[1]);
                 break;
 
             case MIDI_STATUS_PROG_CHANGE:
             case MIDI_STATUS_PRESSURE:
-#if 0
-                    buf[1] = ev->data[0];
-                    Midiws(2-1, buf);
-#else
-                while ((*midi_acia_ctrl & (1 << 1)) == 0);
-                *midi_acia_data = ev->status;
-                while ((*midi_acia_ctrl & (1 << 1)) == 0);
-                *midi_acia_data = ev->data[0];
-#endif
+                if (fifo_space() < 2)
+                    goto fifo_full;
+                fifo_push(status);
+                fifo_push(ev->data[0]);
                 break;
 
             default:
-                printf("Unknown status: %02x\n", ev->status);
+                /* Sysex (0xf0/0xf7): skipped */
+                break;
             }
         }
 
         ev = ev->next;
     }
+fifo_full:
     song->events = ev;
-    song->timer_b_counter++;
 
-    *(volatile Uint8 *)0xFFFFFA0FL = ~(1 << 0);    /* clear in service bit */
+    /* bytes queued and TX interrupt not armed: arm it. If TDRE is
+     * already set this asserts the ACIA IRQ at once (falling edge on
+     * GPIP I4), so transmission starts right after we return. */
+    if (s_fifoHead != s_fifoTail && !s_tie)
+    {
+        s_tie = SDL_TRUE;
+        MIDI_ACIA_CTRL = ACIA_CTRL_TIE_ON;
+    }
+
+    MFP_ISRA = ~(1 << 0);   /* clear in service bit */
 }
 
-static void setup_timer(float desired_clock, Uint8 *ctrl, Uint8 *data)
+/* kb_midisys hook: called (jsr, supervisor) by the TOS $118 handler on
+ * every ACIA interrupt, in a loop until the interrupt line is released.
+ * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
+ * leaving TIE armed with nothing to send would hang the midikey loop. */
+static long midi_acia_hook(void)
 {
-    static const Uint32 clock = 2457600;
-    static const Uint32 dividers[8] = { -1, 4, 10, 16, 50, 64, 100, 200 };
-    int i, j;
-    float diff = UINT_MAX;
-
-    printf("Requesting: %.2f Hz\n", desired_clock);
-
-    for (i = 7; i > 0; --i)
+    if (s_tie && (MIDI_ACIA_CTRL & ACIA_TDRE))
     {
-        const float prescaled = clock / dividers[i];
-
-        for (j = 1; j < 256; ++j)
+        if (s_fifoHead != s_fifoTail)
         {
-            float diff_current = (prescaled / j) - desired_clock;
-            /* avoid math.h's abs() */
-            diff_current = diff_current >= 0 ? diff_current : -diff_current;
-            if (diff_current < diff)
-            {
-                diff = diff_current;
-                *ctrl = i;
-                *data = j;
-            }
+            MIDI_ACIA_DATA = s_fifo[s_fifoTail];
+            s_fifoTail = (s_fifoTail + 1) & FIFO_MASK;
+        }
+        else
+        {
+            MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+            s_tie = SDL_FALSE;
         }
     }
 
-    printf("Got: %.2f Hz\n", (float)clock / dividers[*ctrl] / *data);
+    /* chain the original handler for the receive side; it does not
+     * follow the C ABI (clobbers d2/a2), hence no plain C call */
+    __asm__ volatile (
+        "movea.l    %0,%%a0\n\t"
+        "jsr        (%%a0)"
+        :
+        : "g"(s_oldMidisys)
+        : "d0","d1","d2","d3","a0","a1","a2","a3","memory","cc");
+
+    return 0;
+}
+
+static long hook_install(void)
+{
+    s_tie = SDL_FALSE;
+    MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+
+    if (!s_oldMidisys)
+    {
+        s_oldMidisys = s_kbdvecs->midisys;
+        s_kbdvecs->midisys = midi_acia_hook;
+    }
+
+    return 0;
+}
+
+static void acia_send(Uint8 b)
+{
+    while ((MIDI_ACIA_CTRL & ACIA_TDRE) == 0)
+        ;
+    MIDI_ACIA_DATA = b;
+}
+
+static long hook_remove(void)
+{
+    int i;
+
+    s_tie = SDL_FALSE;
+    MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+
+    /* Silence every channel. A status byte aborts a possibly
+     * half-transmitted message, so the stream stays parseable. */
+    for (i = 0; i < 16; ++i)
+    {
+        acia_send(0xb0 | i);
+        acia_send(0x78);    /* All Sound Off */
+        acia_send(0x00);
+        acia_send(0xb0 | i);
+        acia_send(0x7b);    /* All Notes Off */
+        acia_send(0x00);
+    }
+
+    if (s_oldMidisys)
+    {
+        s_kbdvecs->midisys = s_oldMidisys;
+        s_oldMidisys = NULL;
+    }
+
+    return 0;
 }
 
 int native_midi_detect()
@@ -162,37 +301,9 @@ int native_midi_detect()
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw)
 {
-    int timer_b_index = 0;
-
     printf("%s\n", __FUNCTION__);
 
     s_nativeMidiSong.events = s_nativeMidiSong.firstEvent = CreateMIDIEventList(rw, &s_nativeMidiSong.ticksPerQuarterNote);
-    s_nativeMidiSong.timer_b_counter = 0;
-    s_nativeMidiSong.timer_b_current_value = 0;
-
-    setup_timer(
-        (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / 500000,
-        &s_nativeMidiSong.timer_b_values[timer_b_index].ctrl,
-        &s_nativeMidiSong.timer_b_values[timer_b_index].data);
-    timer_b_index++;
-
-    for (const MIDIEvent *ev = s_nativeMidiSong.firstEvent; ev; ev = ev->next)
-    {
-        if (ev->status == 0xff && ev->data[0] == 0x51)
-        {
-            if (timer_b_index == 255)
-            {
-                printf("Too many tempo changes\n");
-                return NULL;
-            }
-
-            setup_timer(
-                (s_nativeMidiSong.ticksPerQuarterNote * 1000000.0f) / ((ev->extraData[0] << 16) + (ev->extraData[1] << 8) + ev->extraData[2]),
-                &s_nativeMidiSong.timer_b_values[timer_b_index].ctrl,
-                &s_nativeMidiSong.timer_b_values[timer_b_index].data);
-            timer_b_index++;
-        }
-    }
 
     if (freerw)
         SDL_RWclose(rw);
@@ -218,15 +329,21 @@ void native_midi_start(NativeMidiSong *song, int loops)
         return;
 
     song->events = s_nativeMidiSong.firstEvent;
-    song->timer_b_counter = 0;
-    song->timer_b_current_value = 0;
+
+    s_tickAdd    = midi_ticks_per_period(DEFAULT_TEMPO);
+    s_tickFrac   = 0;
+    s_tickInt   = 0;
+    s_fifoHead   = s_fifoTail = 0;
+
+    s_kbdvecs = Kbdvbase();
+    Supexec(hook_install);
 
     /* TODO */
     song->loops = loops;
 
     Jdisint(MFP_TIMERB);
     song->old_timer_b = (Uint32)Setexc(0x120>>2, -1);
-    Xbtimer(XB_TIMERB, song->timer_b_values[song->timer_b_current_value].ctrl, song->timer_b_values[song->timer_b_current_value].data, timer_b);
+    Xbtimer(XB_TIMERB, TIMER_B_CTRL, TIMER_B_DATA, timer_b);
 
     song->active = 1;
 }
@@ -242,6 +359,9 @@ void native_midi_stop()
         s_nativeMidiSong.old_timer_b = 0;
     }
 
+    if (s_kbdvecs)
+        Supexec(hook_remove);
+
     s_nativeMidiSong.active = 0;
 }
 
@@ -249,7 +369,8 @@ int native_midi_active()
 {
     /* printf("%s (%d/%p)\n", __FUNCTION__, s_nativeMidiSong.active, s_nativeMidiSong.events); */
 
-    return s_nativeMidiSong.active && s_nativeMidiSong.events;
+    return s_nativeMidiSong.active
+        && (s_nativeMidiSong.events || s_fifoHead != s_fifoTail);
 }
 
 void native_midi_setvolume(int volume)

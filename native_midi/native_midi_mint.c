@@ -64,7 +64,11 @@
 /* /16 clock, 8N1, RTS low, TX interrupt on, RX interrupt on.*/
 #define ACIA_CTRL_TIE_ON    0xB5
 
+#define MFP_IERA        (*(volatile Uint8 *)0xFFFFFA07L)
+#define MFP_IPRA        (*(volatile Uint8 *)0xFFFFFA0BL)
 #define MFP_ISRA        (*(volatile Uint8 *)0xFFFFFA0FL)
+#define MFP_IMRA        (*(volatile Uint8 *)0xFFFFFA13L)
+#define MFP_TBCR        (*(volatile Uint8 *)0xFFFFFA1BL)
 
 #define MFP_CLOCK       2457600UL
 #define TIMER_B_CTRL    3       /* prescaler /16 */
@@ -90,8 +94,6 @@ struct _NativeMidiSong
     SDL_bool active;
 
     Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
-
-    Uint32 old_timer_b;
 };
 static NativeMidiSong s_nativeMidiSong;
 
@@ -107,8 +109,39 @@ static Uint8 s_fifo[FIFO_SIZE];
 static volatile Uint16 s_fifoHead, s_fifoTail;
 
 static volatile SDL_bool s_tie;     /* shadow: is the TX interrupt enabled? */
-static long (*s_oldMidisys)(void);
 static _KBDVECS *s_kbdvecs;
+
+/* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
+typedef void (*XbraHandler)(void);
+extern XbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, XbraHandler handler);
+
+#define XBRA_APP_ID     0x4C53444DUL    /* 'LSDM' */
+
+/* native_midi_mint_xbra.S */
+extern void midisys_handler(void);
+extern XbraHandler midisys_oldvec;
+
+static Uint32 s_oldTimerbVec;
+static Uint8 s_oldTbcr;
+static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
+
+static __inline__ Uint16 set_ipl7(void)
+{
+    Uint16 sr;
+#ifdef __mcoldfire__
+    /* ColdFire has no ori to SR; this runs in supervisor mode, so
+     * setting the S bit along with the mask is safe */
+    __asm__ volatile ("move.w %%sr,%0\n\tmove.w #0x2700,%%sr" : "=d"(sr) : : "memory");
+#else
+    __asm__ volatile ("move.w %%sr,%0\n\tori.w #0x0700,%%sr" : "=d"(sr) : : "memory");
+#endif
+    return sr;
+}
+
+static __inline__ void restore_ipl(Uint16 sr)
+{
+    __asm__ volatile ("move.w %0,%%sr" : : "d"(sr) : "memory");
+}
 
 static __inline__ Uint16 fifo_space(void)
 {
@@ -217,7 +250,7 @@ fifo_full:
  * every ACIA interrupt, in a loop until the interrupt line is released.
  * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
  * leaving TIE armed with nothing to send would hang the midikey loop. */
-static long midi_acia_hook(void)
+void midi_acia_hook(void)
 {
     if (s_tie && (MIDI_ACIA_CTRL & ACIA_TDRE))
     {
@@ -232,29 +265,26 @@ static long midi_acia_hook(void)
             s_tie = SDL_FALSE;
         }
     }
-
-    /* chain the original handler for the receive side; it does not
-     * follow the C ABI (clobbers d2/a2), hence no plain C call */
-    __asm__ volatile (
-        "movea.l    %0,%%a0\n\t"
-        "jsr        (%%a0)"
-        :
-        : "g"(s_oldMidisys)
-        : "d0","d1","d2","d3","a0","a1","a2","a3","memory","cc");
-
-    return 0;
 }
 
 static long hook_install(void)
 {
+    Uint16 sr = set_ipl7();
+
+    s_oldTbcr = MFP_TBCR;
+    s_oldTimerbEnabled = (MFP_IERA & (1 << 0)) != 0;
+    s_oldTimerbMasked  = (MFP_IMRA & (1 << 0)) != 0;
+
     s_tie = SDL_FALSE;
     MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
 
-    if (!s_oldMidisys)
+    if ((XbraHandler)s_kbdvecs->midisys != midisys_handler)
     {
-        s_oldMidisys = s_kbdvecs->midisys;
-        s_kbdvecs->midisys = midi_acia_hook;
+        midisys_oldvec = (XbraHandler)s_kbdvecs->midisys;
+        s_kbdvecs->midisys = (long (*)(void))midisys_handler;
     }
+
+    restore_ipl(sr);
 
     return 0;
 }
@@ -268,12 +298,18 @@ static void acia_send(Uint8 b)
 
 static long hook_remove(void)
 {
+    Uint16 sr;
     int i;
 
-    s_tie = SDL_FALSE;
+    /* order matters: hardware TIE off first, only then the shadow */
+    sr = set_ipl7();
     MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+    s_tie = SDL_FALSE;
+    restore_ipl(sr);
 
-    /* Silence every channel. A status byte aborts a possibly
+    /* Silence every channel (TIE is off, so polled sending cannot race
+     * the consumer; interrupts stay enabled, this takes ~30 ms).
+     * A status byte aborts a possibly
      * half-transmitted message, so the stream stays parseable. */
     for (i = 0; i < 16; ++i)
     {
@@ -285,11 +321,18 @@ static long hook_remove(void)
         acia_send(0x00);
     }
 
-    if (s_oldMidisys)
-    {
-        s_kbdvecs->midisys = s_oldMidisys;
-        s_oldMidisys = NULL;
-    }
+    sr = set_ipl7();
+
+    Atari_UnhookXbra((Uint32)&s_kbdvecs->midisys, XBRA_APP_ID, midisys_handler);
+
+    MFP_TBCR = s_oldTbcr;
+    MFP_IPRA = (Uint8)~(1 << 0);    /* discard a pending tick of ours */
+    if (s_oldTimerbEnabled)
+        MFP_IERA |= 1 << 0;
+    if (s_oldTimerbMasked)
+        MFP_IMRA |= 1 << 0;
+
+    restore_ipl(sr);
 
     return 0;
 }
@@ -342,7 +385,7 @@ void native_midi_start(NativeMidiSong *song, int loops)
     song->loops = loops;
 
     Jdisint(MFP_TIMERB);
-    song->old_timer_b = (Uint32)Setexc(0x120>>2, -1);
+    s_oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
     Xbtimer(XB_TIMERB, TIMER_B_CTRL, TIMER_B_DATA, timer_b);
 
     song->active = 1;
@@ -353,10 +396,10 @@ void native_midi_stop()
     printf("%s\n", __FUNCTION__);
 
     Jdisint(MFP_TIMERB);
-    if (s_nativeMidiSong.old_timer_b)
+    if (s_oldTimerbVec)
     {
-        (void)Setexc(0x120>>2, s_nativeMidiSong.old_timer_b);
-        s_nativeMidiSong.old_timer_b = 0;
+        (void)Setexc(0x120>>2, s_oldTimerbVec);
+        s_oldTimerbVec = 0;
     }
 
     if (s_kbdvecs)

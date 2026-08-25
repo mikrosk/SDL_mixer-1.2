@@ -27,6 +27,8 @@
 #include <mint/osbind.h>
 #include <mint/ostruct.h>
 
+#include "../SDL_mixer.h"
+
 #include "native_midi.h"
 #include "native_midi_common.h"
 
@@ -53,6 +55,15 @@
  *    register asserts IRQ permanently, and since nothing would clear
  *    it, the midikey loop would hang the machine. The hook therefore
  *    always either sends a byte or turns TIE off before returning.
+ *
+ * Volume: a MIDI song controls 16 channel volumes (controller 7) but
+ * the wire has no master volume, so native_midi_setvolume() (called
+ * from music.c for Mix_VolumeMusic() and for fades) implements one by
+ * scaling. s_lastCC7[] holds each channel volume as the song last set
+ * it: the producer updates it from controller 7 events and transmits
+ * s_lastCC7[channel] * s_volume / MIX_MAX_VOLUME. native_midi_setvolume()
+ * stores s_volume, sets s_volDirty and returns; the producer then queues
+ * controller 7 messages with the recomputed values for all 16 channels.
  */
 
 #define MIDI_ACIA_CTRL  (*(volatile Uint8 *)0xFFFFFC04L)
@@ -82,6 +93,7 @@
                                        + MFP_CLOCK/2) / MFP_CLOCK))
 
 #define DEFAULT_TEMPO   500000UL    /* us per quarter note (120 bpm) */
+#define DEFAULT_CC7     100         /* GM default channel volume */
 
 #define FIFO_SIZE       2048        /* power of two */
 #define FIFO_MASK       (FIFO_SIZE - 1)
@@ -109,6 +121,11 @@ static Uint32 s_tickInt;
 
 static Uint8 s_fifo[FIFO_SIZE];
 static volatile Uint16 s_fifoHead, s_fifoTail;
+
+static Uint8 s_lastCC7[16];         /* channel volume as sent by the song */
+static volatile Uint8 s_volume = MIX_MAX_VOLUME;    /* master volume */
+static volatile SDL_bool s_volDirty;        /* set by native_midi_setvolume(),
+                                               consumed by the producer */
 
 static volatile SDL_bool s_tie;     /* shadow: is the TX interrupt enabled? */
 static _KBDVECS *s_kbdvecs;
@@ -143,6 +160,11 @@ static __inline__ Uint16 set_ipl7(void)
 static __inline__ void restore_ipl(Uint16 sr)
 {
     __asm__ volatile ("move.w %0,%%sr" : : "d"(sr) : "memory");
+}
+
+static __inline__ Uint8 scaled_cc7(Uint8 chan)
+{
+    return (Uint16)(s_lastCC7[chan] * s_volume) / MIX_MAX_VOLUME;
 }
 
 static __inline__ Uint16 fifo_space(void)
@@ -204,10 +226,23 @@ static void __attribute__((interrupt)) timer_b(void)
         {
             switch (status >> 4)
             {
+            case MIDI_STATUS_CONTROLLER:
+                if (fifo_space() < 3)
+                    goto fifo_full;
+                if (ev->data[0] == 0x07)
+                {
+                    /* Channel volume: remember it and send it scaled
+                     * by the master volume */
+                    s_lastCC7[status & 0x0f] = ev->data[1];
+                    fifo_push(status);
+                    fifo_push(0x07);
+                    fifo_push(scaled_cc7(status & 0x0f));
+                    break;
+                }
+                /* fall through */
             case MIDI_STATUS_NOTE_OFF:
             case MIDI_STATUS_NOTE_ON:
             case MIDI_STATUS_AFTERTOUCH:
-            case MIDI_STATUS_CONTROLLER:
             case MIDI_STATUS_PITCH_WHEEL:
                 if (fifo_space() < 3)
                     goto fifo_full;
@@ -244,6 +279,20 @@ fifo_full:
         s_tickAdd   = midi_ticks_per_period(DEFAULT_TEMPO);
         s_tickFrac  = 0;
         s_tickInt   = 0;
+    }
+
+    /* Master volume change: resend the scaled channel volumes */
+    if (s_volDirty && fifo_space() >= 16 * 3)
+    {
+        int i;
+
+        s_volDirty = SDL_FALSE;
+        for (i = 0; i < 16; ++i)
+        {
+            fifo_push(0xb0 | i);
+            fifo_push(0x07);
+            fifo_push(scaled_cc7(i));
+        }
     }
 
     /* bytes queued and TX interrupt not armed: arm it. If TDRE is
@@ -393,6 +442,8 @@ void native_midi_freesong(NativeMidiSong *song)
 
 void native_midi_start(NativeMidiSong *song, int loops)
 {
+    int i;
+
     printf("%s: %d\n", __FUNCTION__, loops);
 
     if (s_currentSong)
@@ -405,6 +456,10 @@ void native_midi_start(NativeMidiSong *song, int loops)
     s_tickFrac   = 0;
     s_tickInt    = 0;
     s_fifoHead   = s_fifoTail = 0;
+
+    for (i = 0; i < 16; ++i)
+        s_lastCC7[i] = DEFAULT_CC7;
+    s_volDirty = SDL_TRUE;      /* apply the master volume from the start */
 
     s_kbdvecs = Kbdvbase();
     Supexec(hook_install);
@@ -443,26 +498,15 @@ int native_midi_active()
 
 void native_midi_setvolume(int volume)
 {
-#if 0
-    int i;
-    Uint32 counter;
-    /* https://www.recordingblogs.com/wiki/midi-controller-message (channel 0 out of 15) */
-    Uint8 controller_message[3] = { 0xB0, 0x07, volume };
-
     printf("%s: %d\n", __FUNCTION__, volume);
 
-    if (native_midi_active())
-    {
-        counter = s_nativeMidiSong.timer_b_counter;
-        while (counter == s_nativeMidiSong.timer_b_counter);
-    }
+    if (volume < 0)
+        volume = 0;
+    else if (volume > MIX_MAX_VOLUME)
+        volume = MIX_MAX_VOLUME;
 
-    for (i = 0; i < 16; ++i)
-    {
-        Midiws(3-1, controller_message);
-        controller_message[0]++;
-    }
-#endif
+    s_volume = volume;
+    s_volDirty = SDL_TRUE;
 }
 
 const char *native_midi_error(void)

@@ -22,7 +22,7 @@
 
 #ifdef __MINT__
 
-#include <assert.h>
+#include <stdlib.h>
 
 #include <mint/osbind.h>
 #include <mint/ostruct.h>
@@ -88,14 +88,16 @@
 
 struct _NativeMidiSong
 {
-    MIDIEvent *events;      /* next event to schedule */
     MIDIEvent *firstEvent;
-    int loops;
-    SDL_bool active;
-
     Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
 };
-static NativeMidiSong s_nativeMidiSong;
+
+/* Only one song plays at a time; the playback state lives here and not
+ * in NativeMidiSong. */
+static NativeMidiSong * volatile s_currentSong; /* NULL when stopped */
+static MIDIEvent *s_events;                     /* next event to schedule */
+static Uint32 s_ticksPerQuarterNote;
+static int s_loops;
 
 /* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
  * Every timer interrupt executes s_tickFrac += s_tickAdd; whenever
@@ -163,14 +165,13 @@ static __inline__ Uint32 midi_ticks_per_period(Uint32 tempo)
     q = TICK_NUMER / tempo;
     r = TICK_NUMER % tempo;
 
-    return s_nativeMidiSong.ticksPerQuarterNote * q
-         + (s_nativeMidiSong.ticksPerQuarterNote * r + tempo / 2) / tempo;
+    return s_ticksPerQuarterNote * q
+         + (s_ticksPerQuarterNote * r + tempo / 2) / tempo;
 }
 
 /* Producer: schedule due events into the FIFO, arm the ACIA TX interrupt */
 static void __attribute__((interrupt)) timer_b(void)
 {
-    NativeMidiSong *song = &s_nativeMidiSong;
     MIDIEvent *ev;
 
     /* advance song position */
@@ -179,7 +180,7 @@ static void __attribute__((interrupt)) timer_b(void)
     s_tickFrac &= 0xffff;
 
     /* schedule due events */
-    ev = song->events;
+    ev = s_events;
     while (ev && ev->time <= s_tickInt)
     {
         const Uint8 status = ev->status;
@@ -232,7 +233,7 @@ static void __attribute__((interrupt)) timer_b(void)
         ev = ev->next;
     }
 fifo_full:
-    song->events = ev;
+    s_events = ev;
 
     /* bytes queued and TX interrupt not armed: arm it. If TDRE is
      * already set this asserts the ACIA IRQ at once (falling edge on
@@ -344,51 +345,67 @@ int native_midi_detect()
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw)
 {
+    NativeMidiSong *song;
+
     printf("%s\n", __FUNCTION__);
 
-    s_nativeMidiSong.events = s_nativeMidiSong.firstEvent = CreateMIDIEventList(rw, &s_nativeMidiSong.ticksPerQuarterNote);
+    song = (NativeMidiSong *)malloc(sizeof(*song));
+    if (song)
+    {
+        song->firstEvent = CreateMIDIEventList(rw, &song->ticksPerQuarterNote);
+        if (!song->firstEvent)
+        {
+            free(song);
+            song = NULL;
+        }
+    }
 
     if (freerw)
         SDL_RWclose(rw);
 
-    return s_nativeMidiSong.firstEvent ? &s_nativeMidiSong : NULL;
+    return song;
 }
 
 void native_midi_freesong(NativeMidiSong *song)
 {
     printf("%s\n", __FUNCTION__);
 
+    if (!song)
+        return;
+
+    if (song == s_currentSong)
+        native_midi_stop();
+
     FreeMIDIEventList(song->firstEvent);
-    song->firstEvent = song->events = NULL;
+    free(song);
 }
 
 void native_midi_start(NativeMidiSong *song, int loops)
 {
     printf("%s: %d\n", __FUNCTION__, loops);
 
-    assert(song == &s_nativeMidiSong);
+    if (s_currentSong)
+        native_midi_stop();
 
-    if (song->active)
-        return;
-
-    song->events = s_nativeMidiSong.firstEvent;
+    s_events = song->firstEvent;
+    s_ticksPerQuarterNote = song->ticksPerQuarterNote;
 
     s_tickAdd    = midi_ticks_per_period(DEFAULT_TEMPO);
     s_tickFrac   = 0;
-    s_tickInt   = 0;
+    s_tickInt    = 0;
     s_fifoHead   = s_fifoTail = 0;
 
     s_kbdvecs = Kbdvbase();
     Supexec(hook_install);
 
     /* TODO */
-    song->loops = loops;
+    s_loops = loops;
+
+    s_currentSong = song;
 
     Jdisint(MFP_TIMERB);
     s_oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
     Xbtimer(XB_TIMERB, TIMER_B_CTRL, TIMER_B_DATA, timer_b);
-
-    song->active = 1;
 }
 
 void native_midi_stop()
@@ -405,15 +422,13 @@ void native_midi_stop()
     if (s_kbdvecs)
         Supexec(hook_remove);
 
-    s_nativeMidiSong.active = 0;
+    s_currentSong = NULL;
 }
 
 int native_midi_active()
 {
-    /* printf("%s (%d/%p)\n", __FUNCTION__, s_nativeMidiSong.active, s_nativeMidiSong.events); */
-
-    return s_nativeMidiSong.active
-        && (s_nativeMidiSong.events || s_fifoHead != s_fifoTail);
+    return s_currentSong != NULL
+        && (s_events || s_fifoHead != s_fifoTail);
 }
 
 void native_midi_setvolume(int volume)

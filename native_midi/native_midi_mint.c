@@ -235,6 +235,17 @@ static void __attribute__((interrupt)) timer_b(void)
 fifo_full:
     s_events = ev;
 
+    if (!ev && s_loops)
+    {
+        if (s_loops > 0)
+            s_loops--;
+
+        s_events    = s_currentSong->firstEvent;
+        s_tickAdd   = midi_ticks_per_period(DEFAULT_TEMPO);
+        s_tickFrac  = 0;
+        s_tickInt   = 0;
+    }
+
     /* bytes queued and TX interrupt not armed: arm it. If TDRE is
      * already set this asserts the ACIA IRQ at once (falling edge on
      * GPIP I4), so transmission starts right after we return. */
@@ -398,8 +409,7 @@ void native_midi_start(NativeMidiSong *song, int loops)
     s_kbdvecs = Kbdvbase();
     Supexec(hook_install);
 
-    /* TODO */
-    s_loops = loops;
+    s_loops = loops;    /* number of repeats after the first pass; -1 = forever */
 
     s_currentSong = song;
 
